@@ -14,13 +14,14 @@ import { Heading, Link, Text } from "../components/Typography";
 import dynamic from "next/dynamic";
 import { SketchContainer } from "../components/SketchContainer";
 import { Fade } from "../components/Fade";
-import { ComponentType, useState, useEffect } from "react";
+import { ComponentType, useEffect } from "react";
 import MiniProjectEntry from "../components/MiniProjectEntry";
 import { GlassCard } from "../components/GlassCard";
 import { useAtom } from "jotai";
 import { currentPaletteAtom, type PaletteName } from "../lib/paletteState";
 import { LegendButton } from "../components/LegendButton";
 import { availableThemes } from "../lib/themes";
+import { relaxModeAtom } from "../lib/relaxMode";
 
 const randomSketches = ["circles"];
 
@@ -368,7 +369,7 @@ const Favicons = () => (
 
 const Home: NextPage = () => {
   const [currentPalette, setCurrentPalette] = useAtom(currentPaletteAtom);
-  const [isVibingOut, setIsVibingOut] = useState(false);
+  const [isVibingOut, setIsVibingOut] = useAtom(relaxModeAtom);
 
   // Derive palette names from availableThemes
   const palettes: PaletteName[] = availableThemes.map(

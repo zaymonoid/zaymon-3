@@ -1,14 +1,16 @@
+import { useAtomValue } from "jotai";
 import React, { useEffect, useRef } from "react";
+import { relaxModeAtom } from "../lib/relaxMode";
 import { styled } from "../Stitches";
 import {
-  buildField,
+  createWorld,
   defaultTopoSettings,
+  FieldWindow,
   findSummits,
+  labelCount,
   normAt,
-  packField,
   type Summit,
-  type TopoField,
-  type TopoSettings,
+  type TopoWorld,
 } from "./topo/terrain";
 
 const Canvas = styled("canvas", {
@@ -37,6 +39,8 @@ const cellShaderSource = `
 
   uniform sampler2D uField;   // rg = smooth, ba = ridged, 16-bit each
   uniform vec2 uFieldSize;
+  uniform vec2 uViewSample;   // world sample of the view's top-left dot
+  // The field is a ring buffer: world sample (x, y) is at (x, y) mod uFieldSize
   uniform sampler2D uLabels;  // summit labels: r,a = atlas slot, g = 1 where set
   uniform vec2 uGrid;
   uniform float uRidge;
@@ -47,7 +51,7 @@ const cellShaderSource = `
   uniform float uIndex;
 
   float height(vec2 f) {
-      f = clamp(f, vec2(0.0), uFieldSize - 1.0);
+      f = mod(uViewSample + f, uFieldSize);
       vec4 t = texture2D(uField, (f + 0.5) / uFieldSize) * 255.0;
       float a = (t.r * 256.0 + t.g) / 65535.0;
       float b = (t.b * 256.0 + t.a) / 65535.0;
@@ -100,9 +104,7 @@ const cellShaderSource = `
               // only allows array indices built from loop indices and constants.
               float l = lv[(j + 1) * 4 + i + 1];
               if (l < 0.0) continue;
-              // height() clamps, so at the left/top edge the neighbour is the
-              // sample itself, as before
-              bool edge =
+                      bool edge =
                 lv[(j + 1) * 4 + i + 2] < l || lv[(j + 2) * 4 + i + 1] < l ||
                 lv[(j + 1) * 4 + i] < l || lv[j * 4 + i + 1] < l;
               if (!edge) continue;
@@ -159,6 +161,9 @@ const fragmentShaderSource = `
   uniform vec2 uAtlasGrid;   // atlas slots across, down
   uniform vec3 uWaterGlyphs; // atlas indices of ~, ≈, ·
   uniform vec3 uContour;     // contour ink, drifting with the slow palette cycle
+  uniform vec2 uOrigin;      // world cell of the top-left text cell
+  uniform vec2 uScrollPx;    // sub-cell view offset: shifts the grid left/up by this many px
+  uniform vec2 uDitherPx;    // view offset in px, wrapped: dithering moves with the map
 
   #define topoStrength 1.0
   #define waterDensity 0.6
@@ -194,7 +199,7 @@ const fragmentShaderSource = `
       vec3 color = mix(bgBottom, bgTop, uv.y);
 
       // Which text cell this pixel is in (row 0 at the top)
-      vec2 p = vec2(fragCoord.x, iResolution.y - fragCoord.y);
+      vec2 p = vec2(fragCoord.x, iResolution.y - fragCoord.y) + uScrollPx;
       vec2 cell = floor(p / uCell);
       vec2 local = (p - cell * uCell) / uCell;
 
@@ -215,12 +220,14 @@ const fragmentShaderSource = `
           float alpha = 0.0;
 
           if (kind == 5.0) {
-              float h1 = hash12(cell);
-              float h2 = hash12(cell.yx + vec2(31.0, 17.0));
+              // Water is animated in world cells, so it stays put as the view moves
+              vec2 wc = cell + uOrigin;
+              float h1 = hash12(wc);
+              float h2 = hash12(wc.yx + vec2(31.0, 17.0));
               float tt = iTime;
               float v = 0.0;
               if (h1 < waterDensity) {
-                  float x = cell.x, y = cell.y;
+                  float x = wc.x, y = wc.y;
                   float crest = (sin(x * .95 + y * 1.7 - tt * 1.6 + sin(x * .11 + y * .07 + tt * .35) * 2.2)
                       + .35 * sin(x * .23 - y * .4 + tt * .9)) / 1.35;
                   v = smoothstep(-.2, .9, crest);
@@ -228,7 +235,7 @@ const fragmentShaderSource = `
               } else if (h2 < .14 * shimmer) {
                   float ph = tt * (0.3 + h2 * 3.0) + h2 * 97.0;
                   float k = floor(ph);
-                  float on = step(0.6, hash12(cell + k)) * (.55 + .45 * hash12(cell + k + 3.0));
+                  float on = step(0.6, hash12(wc + k)) * (.55 + .45 * hash12(wc + k + 3.0));
                   v = on * sin(fract(ph) * 3.14159);
                   glyph = uWaterGlyphs.z;
               }
@@ -256,7 +263,10 @@ const fragmentShaderSource = `
       float brightness = dot(color, vec3(0.299, 0.587, 0.114));
 
       // Apply error diffusion layer 1 (coarse)
-      float dithered1 = errorDiffusion(fragCoord, brightness, errorDiffusionScale);
+      // Dither in map space (top-down, wrapped every 4096 px to keep the hash
+      // precise) so the pattern travels with the terrain rather than the screen
+      vec2 ditherCoord = mod(vec2(fragCoord.x, iResolution.y - fragCoord.y) + uDitherPx, 4096.0);
+      float dithered1 = errorDiffusion(ditherCoord, brightness, errorDiffusionScale);
       float ditherDelta1 = (dithered1 - brightness) * errorDiffusionIntensity;
       color = color + vec3(ditherDelta1);
 
@@ -264,12 +274,12 @@ const fragmentShaderSource = `
       brightness = dot(color, vec3(0.299, 0.587, 0.114));
 
       // Apply error diffusion layer 2 (fine)
-      float dithered2 = errorDiffusion(fragCoord, brightness, errorDiffusionScale2);
+      float dithered2 = errorDiffusion(ditherCoord, brightness, errorDiffusionScale2);
       float ditherDelta2 = (dithered2 - brightness) * errorDiffusionIntensity2;
       color = color + vec3(ditherDelta2);
 
       // Apply Bayer dithering to highlights only
-      vec2 bayerCoord = fragCoord / bayerScale;
+      vec2 bayerCoord = ditherCoord / bayerScale;
       float bayerValue = bayer4x4(bayerCoord) - 0.5;
 
       // Recalculate brightness for highlight mask
@@ -304,6 +314,38 @@ const contourAt = (t: number) => {
     ((Math.sign(cycle) * Math.pow(Math.abs(cycle), 0.6) + 1) / 2) * 0.35;
   return [200 + 20 * k, 120 - 50 * k, 70 - 10 * k].map((c) => c / 255);
 };
+
+// The view into the (infinite) world, in device pixels from the world origin.
+// Normally it's locked to the page scroll, so the map moves with the content.
+// In relax mode it can be dragged, panned with the wheel or trackpad, or moved
+// with the arrow keys / WASD, and eases back to the page when relax ends.
+const KEY_SPEED = 700; // CSS px per second (x3 with Shift)
+const INERTIA_DECAY = 5; // per second, after a drag is released
+const RETURN_RATE = 8; // per second, easing back to the page
+// The field window extends this many cells past each edge of the view: room for
+// the neighbour samples at the edges, and for summits just out of view.
+const FIELD_MARGIN = 8;
+const KEYS: Record<string, [number, number]> = {
+  ArrowLeft: [-1, 0],
+  a: [-1, 0],
+  A: [-1, 0],
+  ArrowRight: [1, 0],
+  d: [1, 0],
+  D: [1, 0],
+  ArrowUp: [0, -1],
+  w: [0, -1],
+  W: [0, -1],
+  ArrowDown: [0, 1],
+  s: [0, 1],
+  S: [0, 1],
+};
+// Pointer drags shouldn't start on controls; keys are only ignored while typing
+const isInteractive = (el: EventTarget | null) =>
+  el instanceof Element &&
+  !!el.closest("a, button, input, textarea, select, [role=button]");
+const isTextEntry = (el: EventTarget | null) =>
+  el instanceof HTMLElement &&
+  (el.isContentEditable || !!el.closest("input, textarea, select"));
 
 // Ridges and sea level drift on slow, incommensurate sine waves.
 const TAU = Math.PI * 2;
@@ -353,16 +395,23 @@ function buildAtlas(cellW: number, cellH: number, fontPx: number): Atlas {
   return { canvas, rows, slot };
 }
 
+// Summits are in world cells; write the ones in view, relative to its top-left cell
 function encodeLabels(
   cols: number,
   rows: number,
+  vx: number,
+  vy: number,
   summits: Summit[],
   atlas: Atlas,
 ) {
   const data = new Uint8Array(cols * rows * 4);
   for (const s of summits) {
+    const y = s.y - vy;
+    if (y < 0 || y >= rows) continue;
     for (let k = 0; k < s.text.length; k++) {
-      const i = (s.y * cols + s.x + k) * 4;
+      const x = s.x - vx + k;
+      if (x < 0 || x >= cols) continue;
+      const i = (y * cols + x) * 4;
       const g = atlas.slot.get(s.text[k]) ?? 0; // spaces stay blank
       data[i] = g & 255;
       data[i + 1] = 1;
@@ -410,6 +459,11 @@ function link(gl: WebGLRenderingContext, vs: WebGLShader, fsSource: string) {
 
 export const ShaderBackground: React.FC = () => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const relax = useAtomValue(relaxModeAtom);
+  const relaxRef = useRef(relax);
+  useEffect(() => {
+    relaxRef.current = relax;
+  }, [relax]);
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -465,44 +519,231 @@ export const ShaderBackground: React.FC = () => {
     const now = () =>
       reducedMotion ? 0 : (performance.now() - startTime) / 1000;
 
-    let field: TopoField | null = null;
-    let settings: TopoSettings | null = null;
+    const world: TopoWorld = createWorld({ ...defaultTopoSettings(), seed });
+    let field: FieldWindow | null = null;
     let atlas: Atlas | null = null;
-    let lastLabels = -Infinity;
+    let grid = { cols: 1, rows: 1, cellW: 1, cellH: 1 }; // view grid, device px
+    let summits: Summit[] = [];
+    let lastSummits = -Infinity;
+    let labelsAt = { x: NaN, y: NaN }; // view cell the label texture was built for
 
-    const uploadLabels = (t: number) => {
-      if (!field || !settings || !atlas) return;
-      const summits = findSummits(field, settings, ridgeAt(t), seaAt(t));
+    // --- Where the view is -------------------------------------------------
+    const dprNow = () => window.devicePixelRatio || 1;
+    const pageView = () => ({ x: 0, y: window.scrollY * dprNow() });
+    const view = pageView(); // device px, what's drawn
+    const nav = { x: 0, y: 0, vx: 0, vy: 0 }; // free view in relax mode
+    const keys = new Set<string>();
+    let wasRelax = false;
+    let returning = false;
+    let drag: { x: number; y: number; t: number } | null = null;
+
+    const updateView = (dt: number) => {
+      const relaxNow = relaxRef.current;
+      if (relaxNow && !wasRelax) {
+        Object.assign(nav, { x: view.x, y: view.y, vx: 0, vy: 0 });
+        document.body.style.cursor = "grab";
+        document.body.style.touchAction = "none";
+      } else if (!relaxNow && wasRelax) {
+        returning = true;
+        keys.clear();
+        drag = null;
+        document.body.style.cursor = "";
+        document.body.style.touchAction = "";
+      }
+      wasRelax = relaxNow;
+
+      if (relaxNow) {
+        let kx = 0;
+        let ky = 0;
+        keys.forEach((k) => {
+          const d = KEYS[k];
+          if (d) {
+            kx += d[0];
+            ky += d[1];
+          }
+        });
+        const fast = keys.has("Shift") ? 3 : 1;
+        nav.x += kx * KEY_SPEED * fast * dprNow() * dt;
+        nav.y += ky * KEY_SPEED * fast * dprNow() * dt;
+        if (!drag) {
+          nav.x += nav.vx * dt;
+          nav.y += nav.vy * dt;
+          const decay = Math.exp(-dt * INERTIA_DECAY);
+          nav.vx *= decay;
+          nav.vy *= decay;
+        }
+        view.x = nav.x;
+        view.y = nav.y;
+        return;
+      }
+      const target = pageView();
+      if (returning) {
+        const f = 1 - Math.exp(-dt * RETURN_RATE);
+        view.x += (target.x - view.x) * f;
+        view.y += (target.y - view.y) * f;
+        if (
+          Math.abs(target.x - view.x) < 0.5 &&
+          Math.abs(target.y - view.y) < 0.5
+        )
+          returning = false;
+        return;
+      }
+      view.x = target.x;
+      view.y = target.y;
+    };
+
+    // --- Input (relax mode only) ---------------------------------------------
+    const onPointerDown = (e: PointerEvent) => {
+      if (!relaxRef.current || isInteractive(e.target)) return;
+      drag = { x: e.clientX, y: e.clientY, t: performance.now() };
+      nav.vx = nav.vy = 0;
+      document.body.style.cursor = "grabbing";
+      e.preventDefault();
+    };
+    const onPointerMove = (e: PointerEvent) => {
+      if (!drag || !relaxRef.current) return;
+      const t = performance.now();
+      const dx = (e.clientX - drag.x) * dprNow();
+      const dy = (e.clientY - drag.y) * dprNow();
+      nav.x -= dx;
+      nav.y -= dy;
+      // Smoothed release velocity, device px per second
+      const dts = Math.max(1, t - drag.t) / 1000;
+      nav.vx = nav.vx * 0.5 + (-dx / dts) * 0.5;
+      nav.vy = nav.vy * 0.5 + (-dy / dts) * 0.5;
+      drag = { x: e.clientX, y: e.clientY, t };
+    };
+    const onPointerUp = () => {
+      if (!drag) return;
+      // A pause before letting go means no fling
+      if (performance.now() - drag.t > 80) nav.vx = nav.vy = 0;
+      drag = null;
+      if (relaxRef.current) document.body.style.cursor = "grab";
+    };
+    const onWheel = (e: WheelEvent) => {
+      if (!relaxRef.current) return;
+      const unit =
+        e.deltaMode === 1 ? 16 : e.deltaMode === 2 ? window.innerHeight : 1;
+      nav.x += e.deltaX * unit * dprNow();
+      nav.y += e.deltaY * unit * dprNow();
+      nav.vx = nav.vy = 0;
+      e.preventDefault();
+    };
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (!relaxRef.current || isTextEntry(e.target)) return;
+      if (e.key === "Shift" || KEYS[e.key]) {
+        keys.add(e.key);
+        if (KEYS[e.key]) e.preventDefault();
+      }
+    };
+    const onKeyUp = (e: KeyboardEvent) => {
+      keys.delete(e.key);
+      // Shift changes e.key ("a" vs "A"); drop both cases of a released letter
+      keys.delete(e.key.toLowerCase());
+      keys.delete(e.key.toUpperCase());
+    };
+    const onBlur = () => keys.clear();
+    window.addEventListener("pointerdown", onPointerDown);
+    window.addEventListener("pointermove", onPointerMove);
+    window.addEventListener("pointerup", onPointerUp);
+    window.addEventListener("pointercancel", onPointerUp);
+    window.addEventListener("wheel", onWheel, { passive: false });
+    window.addEventListener("keydown", onKeyDown);
+    window.addEventListener("keyup", onKeyUp);
+    window.addEventListener("blur", onBlur);
+
+    // --- GPU uploads -----------------------------------------------------------
+    // Upload whatever part of the ring buffer changed (a strip, after a move)
+    const uploadField = (full = false) => {
+      if (!field) return;
+      gl.activeTexture(gl.TEXTURE0);
+      gl.bindTexture(gl.TEXTURE_2D, fieldTex);
+      const dirty = field.takeDirty();
+      if (full) {
+        gl.texImage2D(
+          gl.TEXTURE_2D,
+          0,
+          gl.RGBA,
+          field.width,
+          field.height,
+          0,
+          gl.RGBA,
+          gl.UNSIGNED_BYTE,
+          field.pack([0, 0, field.width, field.height]),
+        );
+        return;
+      }
+      for (const r of dirty)
+        gl.texSubImage2D(
+          gl.TEXTURE_2D,
+          0,
+          r[0],
+          r[1],
+          r[2],
+          r[3],
+          gl.RGBA,
+          gl.UNSIGNED_BYTE,
+          field.pack(r),
+        );
+    };
+
+    const findWorldSummits = (t: number) => {
+      if (!field) return;
+      const area = (field.cols * field.rows) / (grid.cols * grid.rows);
+      summits = findSummits(
+        field,
+        ridgeAt(t),
+        seaAt(t),
+        Math.round(labelCount(grid.cols) * area),
+        grid.cols,
+      ).map((s) => ({ ...s, x: s.x + field!.ox, y: s.y + field!.oy }));
+      labelsAt = { x: NaN, y: NaN };
+    };
+
+    const uploadLabels = (vx: number, vy: number) => {
+      if (!atlas) return;
       gl.activeTexture(gl.TEXTURE1);
       gl.bindTexture(gl.TEXTURE_2D, labelTex);
       gl.texImage2D(
         gl.TEXTURE_2D,
         0,
         gl.RGBA,
-        field.cols,
-        field.rows,
+        grid.cols,
+        grid.rows,
         0,
         gl.RGBA,
         gl.UNSIGNED_BYTE,
-        encodeLabels(field.cols, field.rows, summits, atlas),
+        encodeLabels(grid.cols, grid.rows, vx, vy, summits, atlas),
       );
+      labelsAt = { x: vx, y: vy };
     };
 
+    // --- Frame -------------------------------------------------------------------
     const draw = () => {
-      if (!field || !settings || !atlas) return;
+      if (!field || !atlas) return;
       const t = now();
       const ridge = ridgeAt(t);
       const sea = seaAt(t);
-      const norm = normAt(field, ridge);
+      const norm = normAt(world, ridge);
 
-      if (performance.now() - lastLabels > LABEL_INTERVAL_MS) {
-        lastLabels = performance.now();
-        uploadLabels(t);
+      // Whole cells of the view pick which cells to draw; the remainder shifts
+      // the glyph grid by whole device pixels, so movement is smooth and crisp.
+      const px = Math.round(view.x);
+      const py = Math.round(view.y);
+      const vx = Math.floor(px / grid.cellW);
+      const vy = Math.floor(py / grid.cellH);
+
+      // Keep the field centred on the view; each step samples one strip
+      if (field.moveTo(vx - FIELD_MARGIN, vy - FIELD_MARGIN)) uploadField();
+      if (performance.now() - lastSummits > LABEL_INTERVAL_MS) {
+        lastSummits = performance.now();
+        findWorldSummits(t);
       }
+      if (vx !== labelsAt.x || vy !== labelsAt.y) uploadLabels(vx, vy);
 
-      // Pass 1: terrain -> per-cell glyphs
+      // Pass 1: terrain -> per-cell glyphs, for the cells in view
       gl.bindFramebuffer(gl.FRAMEBUFFER, cellFbo);
-      gl.viewport(0, 0, field.cols, field.rows);
+      gl.viewport(0, 0, grid.cols, grid.rows);
       gl.useProgram(cellProgram);
       gl.activeTexture(gl.TEXTURE0);
       gl.bindTexture(gl.TEXTURE_2D, fieldTex);
@@ -511,6 +752,7 @@ export const ShaderBackground: React.FC = () => {
       gl.uniform1f(cu("uRidge"), ridge);
       gl.uniform1f(cu("uSea"), sea);
       gl.uniform2f(cu("uNorm"), norm.min, norm.max);
+      gl.uniform2f(cu("uViewSample"), vx * 2, vy * 4);
       gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
 
       // Pass 2: glyphs -> screen, with the dither stack
@@ -524,12 +766,20 @@ export const ShaderBackground: React.FC = () => {
       gl.uniform2f(du("iResolution"), canvas.width, canvas.height);
       gl.uniform1f(du("iTime"), t);
       gl.uniform3fv(du("uContour"), contourAt(t));
+      gl.uniform2f(du("uOrigin"), vx, vy);
+      gl.uniform2f(du("uScrollPx"), px - vx * grid.cellW, py - vy * grid.cellH);
+      // Wrapped on the CPU in doubles; 4096 is a multiple of every dither tile size
+      gl.uniform2f(
+        du("uDitherPx"),
+        ((px % 4096) + 4096) % 4096,
+        ((py % 4096) + 4096) % 4096,
+      );
       gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
     };
 
-    // (Re)build the terrain and glyph atlas for the current viewport.
+    // (Re)build the field window and glyph atlas for the current viewport.
     const rebuild = () => {
-      const dpr = window.devicePixelRatio || 1;
+      const dpr = dprNow();
       canvas.width = Math.round(window.innerWidth * dpr);
       canvas.height = Math.round(window.innerHeight * dpr);
 
@@ -541,27 +791,28 @@ export const ShaderBackground: React.FC = () => {
         Math.round(measure.measureText("MMMMMMMMMM").width / 10),
       );
       const cellH = Math.max(1, Math.round(fontPx * LINE_HEIGHT));
-      const cols = Math.ceil(canvas.width / cellW);
-      const rows = Math.ceil(canvas.height / cellH);
+      // One extra column and row so the grid still covers the screen while
+      // shifted by a partial cell
+      const cols = Math.ceil(canvas.width / cellW) + 1;
+      const rows = Math.ceil(canvas.height / cellH) + 1;
+      grid = { cols, rows, cellW, cellH };
 
-      settings = { ...defaultTopoSettings(cols), seed };
-      field = buildField(cols, rows, settings);
+      if (!relaxRef.current && !returning) Object.assign(view, pageView());
+      const vx = Math.floor(Math.round(view.x) / cellW);
+      const vy = Math.floor(Math.round(view.y) / cellH);
+      const m = FIELD_MARGIN;
+      field = new FieldWindow(
+        world,
+        cols + 2 * m,
+        rows + 2 * m,
+        vx - m,
+        vy - m,
+      );
       atlas = buildAtlas(cellW, cellH, fontPx);
 
       gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+      uploadField(true);
       gl.activeTexture(gl.TEXTURE0);
-      gl.bindTexture(gl.TEXTURE_2D, fieldTex);
-      gl.texImage2D(
-        gl.TEXTURE_2D,
-        0,
-        gl.RGBA,
-        field.width,
-        field.height,
-        0,
-        gl.RGBA,
-        gl.UNSIGNED_BYTE,
-        packField(field),
-      );
       gl.bindTexture(gl.TEXTURE_2D, atlasTex);
       gl.texImage2D(
         gl.TEXTURE_2D,
@@ -596,9 +847,9 @@ export const ShaderBackground: React.FC = () => {
       gl.useProgram(cellProgram);
       gl.uniform2f(cu("uFieldSize"), field.width, field.height);
       gl.uniform2f(cu("uGrid"), cols, rows);
-      gl.uniform2f(cu("uPackRange"), field.lo, field.hi);
-      gl.uniform1f(cu("uLevels"), settings.levels);
-      gl.uniform1f(cu("uIndex"), settings.index);
+      gl.uniform2f(cu("uPackRange"), world.lo, world.hi);
+      gl.uniform1f(cu("uLevels"), world.settings.levels);
+      gl.uniform1f(cu("uIndex"), world.settings.index);
 
       gl.useProgram(displayProgram);
       gl.uniform2f(du("uGrid"), cols, rows);
@@ -609,7 +860,7 @@ export const ShaderBackground: React.FC = () => {
       );
       gl.uniform3f(du("uWaterGlyphs"), tilde, approx, dot);
 
-      lastLabels = -Infinity;
+      lastSummits = -Infinity;
       draw();
     };
 
@@ -623,21 +874,42 @@ export const ShaderBackground: React.FC = () => {
     window.addEventListener("resize", handleResize);
     document.fonts?.ready.then(rebuild);
 
-    // Animation loop at 30fps
+    // The terrain animates at 30fps; whenever the view moves (page scroll or
+    // relax-mode navigation) frames are drawn at the display's rate so the map
+    // tracks smoothly. With reduced motion, only movement redraws.
     let raf = 0;
     let lastFrameTime = 0;
+    let lastTick = performance.now();
+    const drawn = { x: NaN, y: NaN };
     const frameInterval = 1000 / 30;
     const render = (frameTime: number) => {
       raf = requestAnimationFrame(render);
+      const dt = Math.min(0.1, Math.max(0, (frameTime - lastTick) / 1000));
+      lastTick = frameTime;
+      updateView(dt);
+      const moved =
+        Math.round(view.x) !== drawn.x || Math.round(view.y) !== drawn.y;
       const elapsed = frameTime - lastFrameTime;
-      if (elapsed < frameInterval) return;
-      lastFrameTime = frameTime - (elapsed % frameInterval);
+      if (!moved && (reducedMotion || elapsed < frameInterval)) return;
+      if (!moved) lastFrameTime = frameTime - (elapsed % frameInterval);
+      drawn.x = Math.round(view.x);
+      drawn.y = Math.round(view.y);
       draw();
     };
-    if (!reducedMotion) raf = requestAnimationFrame(render);
+    raf = requestAnimationFrame(render);
 
     return () => {
       window.removeEventListener("resize", handleResize);
+      window.removeEventListener("pointerdown", onPointerDown);
+      window.removeEventListener("pointermove", onPointerMove);
+      window.removeEventListener("pointerup", onPointerUp);
+      window.removeEventListener("pointercancel", onPointerUp);
+      window.removeEventListener("wheel", onWheel);
+      window.removeEventListener("keydown", onKeyDown);
+      window.removeEventListener("keyup", onKeyUp);
+      window.removeEventListener("blur", onBlur);
+      document.body.style.cursor = "";
+      document.body.style.touchAction = "";
       clearTimeout(resizeTimer);
       cancelAnimationFrame(raf);
       for (const tex of [fieldTex, labelTex, cellTex, atlasTex])
