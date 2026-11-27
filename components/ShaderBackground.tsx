@@ -77,19 +77,34 @@ const cellShaderSource = `
           return;
       }
 
+      // Every sample this cell needs (8 dots, their neighbours, and the
+      // corners for the water test) lies in a 4x6 block from (-1,-1) to (2,4)
+      // relative to the cell's first dot. Read each sample once.
+      vec2 origin = vec2(cell.x * 2.0, cell.y * 4.0);
+      float h[24];
+      float lv[24];
+      for (int y = 0; y < 6; y++) {
+          for (int x = 0; x < 4; x++) {
+              float v = height(origin + vec2(float(x) - 1.0, float(y) - 1.0));
+              h[y * 4 + x] = v;
+              lv[y * 4 + x] = level(v);
+          }
+      }
+
       // Braille dot bits, in dot order (column-major, as in U+2800..28FF)
       float bits = 0.0;
       float best = -2.0;
       for (int j = 0; j < 4; j++) {
           for (int i = 0; i < 2; i++) {
-              vec2 f = vec2(cell.x * 2.0 + float(i), cell.y * 4.0 + float(j));
-              float l = level(height(f));
+              // Block index of this dot is (j + 1) * 4 + (i + 1). GLSL ES 1.0
+              // only allows array indices built from loop indices and constants.
+              float l = lv[(j + 1) * 4 + i + 1];
               if (l < 0.0) continue;
+              // height() clamps, so at the left/top edge the neighbour is the
+              // sample itself, as before
               bool edge =
-                  level(height(f + vec2(1.0, 0.0))) < l ||
-                  level(height(f + vec2(0.0, 1.0))) < l ||
-                  level(height(f - vec2(1.0, 0.0))) < l ||
-                  level(height(f - vec2(0.0, 1.0))) < l;
+                lv[(j + 1) * 4 + i + 2] < l || lv[(j + 2) * 4 + i + 1] < l ||
+                lv[(j + 1) * 4 + i] < l || lv[j * 4 + i + 1] < l;
               if (!edge) continue;
               float bit = j == 3 ? (i == 0 ? 64.0 : 128.0) : pow(2.0, float(j + i * 3));
               bits += bit;
@@ -103,8 +118,8 @@ const cellShaderSource = `
           return;
       }
 
-      vec2 c = vec2(cell.x * 2.0, cell.y * 4.0);
-      float m = (height(c) + height(c + vec2(2.0, 0.0)) + height(c + vec2(2.0, 4.0)) + height(c + vec2(0.0, 4.0))) / 4.0;
+      // Corners (0,0), (2,0), (2,4), (0,4) of the cell, offset by the block origin
+      float m = (h[5] + h[7] + h[23] + h[21]) / 4.0;
       if (m < uSea) {
           gl_FragColor = encode(0.0, 5.0, min(1.0, (uSea - m) / max(uSea, 0.01)));
           return;
@@ -127,34 +142,14 @@ const fragmentShaderSource = `
   #define errorDiffusionScale2 1.
   #define colorNum 128.0  // Number of color levels per channel
 
-  // Bayer matrix (4x4)
+  // Bayer matrix (4x4), built from the 2x2 one:
+  // [0 8 2 10; 12 4 14 6; 3 11 1 9; 15 7 13 5] / 16
+  float bayer2(vec2 p) {
+      return mod(p.x * 2.0 + p.y * 3.0, 4.0);
+  }
   float bayer4x4(vec2 position) {
-      vec2 pos = mod(position, 4.0);
-      int x = int(pos.x);
-      int y = int(pos.y);
-
-      // Use if-else chain instead of array indexing
-      if (y == 0) {
-          if (x == 0) return 0.0/16.0;
-          if (x == 1) return 8.0/16.0;
-          if (x == 2) return 2.0/16.0;
-          return 10.0/16.0;
-      } else if (y == 1) {
-          if (x == 0) return 12.0/16.0;
-          if (x == 1) return 4.0/16.0;
-          if (x == 2) return 14.0/16.0;
-          return 6.0/16.0;
-      } else if (y == 2) {
-          if (x == 0) return 3.0/16.0;
-          if (x == 1) return 11.0/16.0;
-          if (x == 2) return 1.0/16.0;
-          return 9.0/16.0;
-      } else {
-          if (x == 0) return 15.0/16.0;
-          if (x == 1) return 7.0/16.0;
-          if (x == 2) return 13.0/16.0;
-          return 5.0/16.0;
-      }
+      vec2 pos = floor(mod(position, 4.0));
+      return (4.0 * bayer2(mod(pos, 2.0)) + bayer2(floor(pos / 2.0))) / 16.0;
   }
 
   uniform sampler2D uData;   // per-cell: r,a = glyph index (lo,hi), g = kind, b = water depth
@@ -163,6 +158,7 @@ const fragmentShaderSource = `
   uniform vec2 uCell;        // cell size in device px
   uniform vec2 uAtlasGrid;   // atlas slots across, down
   uniform vec3 uWaterGlyphs; // atlas indices of ~, ≈, ·
+  uniform vec3 uContour;     // contour ink, drifting with the slow palette cycle
 
   #define topoStrength 1.0
   #define waterDensity 0.6
@@ -179,33 +175,13 @@ const fragmentShaderSource = `
       return texture2D(uAtlas, (slot + local) / uAtlasGrid).a;
   }
 
-  // Simulated error diffusion with threshold
+  // Error-diffusion-style threshold: one hash per (scale x scale) block.
+  // (An earlier version also summed neighbour error, but its weights never
+  // applied, so the error was always zero; this gives identical output.)
   float errorDiffusion(vec2 coord, float value, float scale) {
       vec2 noiseCoord = floor(coord / scale);
       float threshold = fract(sin(dot(noiseCoord, vec2(12.9898, 78.233))) * 43758.5453);
-
-      float error = 0.0;
-
-      for(float y = -1.0; y <= 0.0; y += 1.0) {
-          for(float x = -1.0; x <= 1.0; x += 1.0) {
-              if(y == 0.0 && x > 0.0) continue;
-              vec2 sampleCoord = noiseCoord + vec2(x, y);
-              float sampleHash = fract(sin(dot(sampleCoord, vec2(12.9898, 78.233))) * 43758.5453);
-              float sampleError = fract(sampleHash * 7.919) - 0.5;
-
-              float weight = 0.0;
-              if(x == 1.0 && y == 0.0) weight = 7.0/16.0;
-              else if(x == -1.0 && y == 1.0) weight = 3.0/16.0;
-              else if(x == 0.0 && y == 1.0) weight = 5.0/16.0;
-              else if(x == 1.0 && y == 1.0) weight = 1.0/16.0;
-
-              error += sampleError * weight;
-          }
-      }
-
-      // Apply threshold with accumulated error
-      float adjustedValue = value + error * 0.5;
-      return (adjustedValue > threshold) ? 1.0 : 0.0;
+      return (value > threshold) ? 1.0 : 0.0;
   }
 
   void main() {
@@ -229,15 +205,11 @@ const fragmentShaderSource = `
           float depth = d.b;
 
           vec3 cream = vec3(255, 180, 100) / vec3(255);
-          vec3 rust = vec3(220, 70, 60) / vec3(255);
           vec3 shore = vec3(120, 150, 130) / vec3(255);
           vec3 water = vec3(95, 135, 125) / vec3(255);
           vec3 glint = vec3(185, 210, 175) / vec3(255);
 
-          // Slow warm drift on the contour ink, a nod to the old palette cycle
-          float cycle = sin(iTime * 0.25);
-          float t = (sign(cycle) * pow(abs(cycle), 0.6) + 1.) / 2.;
-          vec3 contour = mix(vec3(200, 120, 70) / vec3(255), rust, t * 0.35);
+          vec3 contour = uContour;
 
           vec3 ink = vec3(0.0);
           float alpha = 0.0;
@@ -323,6 +295,15 @@ const FONT_STACK = '"Iosevka SS05", Menlo, "DejaVu Sans Mono", monospace';
 const LABEL_CHARS = "▲0123456789";
 const WATER_GLYPHS = ["~", "≈", "·"];
 const LABEL_INTERVAL_MS = 500;
+
+// Slow warm drift on the contour ink, a nod to the old palette cycle:
+// mixes from (200,120,70) toward rust (220,70,60).
+const contourAt = (t: number) => {
+  const cycle = Math.sin(t * 0.25);
+  const k =
+    ((Math.sign(cycle) * Math.pow(Math.abs(cycle), 0.6) + 1) / 2) * 0.35;
+  return [200 + 20 * k, 120 - 50 * k, 70 - 10 * k].map((c) => c / 255);
+};
 
 // Ridges and sea level drift on slow, incommensurate sine waves.
 const TAU = Math.PI * 2;
@@ -542,6 +523,7 @@ export const ShaderBackground: React.FC = () => {
       gl.bindTexture(gl.TEXTURE_2D, atlasTex);
       gl.uniform2f(du("iResolution"), canvas.width, canvas.height);
       gl.uniform1f(du("iTime"), t);
+      gl.uniform3fv(du("uContour"), contourAt(t));
       gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
     };
 
